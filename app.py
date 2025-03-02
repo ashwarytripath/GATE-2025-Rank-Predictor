@@ -8,32 +8,33 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# Define the Excel file path for storing candidate inputs
 EXCEL_FILE = "candidate_data.xlsx"
 
+# ------------------------------------------------------------------------------
+# 1) DATA CLEANING
+# ------------------------------------------------------------------------------
 def clean_candidate_data(df):
     """
     Clean and validate candidate data:
-      - Normalize candidate_id: trim, uppercase, and ensure it matches the pattern CS##S########.
-      - Ensure marks are numeric and between 0 and 100.
-      - Ensure shift is either "Morning" or "Afternoon" (case-insensitive).
-      - Ensure branch is "CSE".
+      - candidate_id must match the pattern CS##S######## (uppercase).
+      - marks must be numeric and between 0 and 100.
+      - shift must be "Morning" or "Afternoon".
+      - branch must be "CSE".
     Invalid rows are removed.
     """
     if df.empty:
         return df
 
-    # Normalize candidate_id: convert to string, strip spaces, and uppercase
+    # Normalize candidate_id
     df["candidate_id"] = df["candidate_id"].astype(str).str.strip().str.upper()
-    # Keep only rows where candidate_id matches the required format.
-    valid_pattern = r'^CS\d{2}S\d{8}$'
-    df = df[df["candidate_id"].str.fullmatch(valid_pattern, na=False)]
+    pattern = r'^CS\d{2}S\d{8}$'
+    df = df[df["candidate_id"].str.fullmatch(pattern, na=False)]
 
-    # Convert marks to numeric and remove rows where marks are not between 0 and 100.
+    # Normalize marks
     df["marks"] = pd.to_numeric(df["marks"], errors="coerce")
     df = df[df["marks"].between(0, 100)]
 
-    # Normalize shift: capitalize and remove extra spaces.
+    # Normalize shift
     df["shift"] = df["shift"].astype(str).str.strip().str.capitalize()
     df = df[df["shift"].isin(["Morning", "Afternoon"])]
 
@@ -43,12 +44,15 @@ def clean_candidate_data(df):
 
     return df
 
+# ------------------------------------------------------------------------------
+# 2) FILE LOAD/SAVE
+# ------------------------------------------------------------------------------
 def load_candidate_data():
     if os.path.exists(EXCEL_FILE):
         try:
             df = pd.read_excel(EXCEL_FILE)
             df = clean_candidate_data(df)
-            # Optionally, save the cleaned data back to the Excel file.
+            # Optionally save cleaned data back to Excel
             save_candidate_data(df)
             return df
         except Exception as e:
@@ -63,32 +67,96 @@ def save_candidate_data(df):
     except Exception as e:
         app.logger.error(f"Error writing Excel file: {e}")
 
-def compute_top_mean(df):
+# ------------------------------------------------------------------------------
+# 3) HELPER FUNCTIONS FOR GATE CALCULATIONS
+# ------------------------------------------------------------------------------
+def compute_cutoff(df):
+    """
+    Compute M_q for general category using the GATE formula:
+       M_q = max(25, min(40, mu + sigma))
+    where mu is the mean, sigma is the std dev of all marks.
+    """
     if df.empty:
-        return 80.0  # Default if no data exists
+        return 25.0  # Fallback if no data
+
+    mu = df["marks"].mean()
+    sigma = df["marks"].std(ddof=1)  # sample std dev
+    if pd.isna(sigma):
+        sigma = 0.0
+    return max(25, min(40, mu + sigma))
+
+def compute_cutoff_for_session(df, shift):
+    """
+    Compute M_q for the session (e.g. "Morning" or "Afternoon")
+    using the same formula. This is needed for multi-session normalization.
+    """
+    session_df = df[df["shift"] == shift]
+    if session_df.empty:
+        return 25.0
+    mu_s = session_df["marks"].mean()
+    sigma_s = session_df["marks"].std(ddof=1)
+    if pd.isna(sigma_s):
+        sigma_s = 0.0
+    return max(25, min(40, mu_s + sigma_s))
+
+def compute_top_mean(df):
+    """
+    Compute M_t = mean of top 0.1% marks (or at least 1 candidate).
+    Could also enforce a minimum of top 10 if desired.
+    """
+    if df.empty:
+        return 80.0
     sorted_df = df.sort_values(by="marks", ascending=False)
     count = len(sorted_df)
-    top_count = max(1, int(count * 0.001))  # Top 0.1% (or at least one candidate)
+    top_count = max(1, int(count * 0.001))
     top_candidates = sorted_df.head(top_count)
     return top_candidates["marks"].mean()
 
 def normalize_marks(raw_marks, shift):
+    """
+    Multi-session normalization (approx GATE approach):
+       M_ij = M_q_global + ( (M_t_global - M_q_global)/(M_t_session - M_q_session) ) * ( raw_marks - M_q_session )
+    If session top mean == session M_q => fallback to raw_marks.
+    """
     df = load_candidate_data()
-    global_mt = compute_top_mean(df)
+
+    # Global cutoff & top mean
+    M_q_global = compute_cutoff(df)
+    M_t_global = compute_top_mean(df)
+
+    # Session cutoff & top mean
+    M_q_session = compute_cutoff_for_session(df, shift)
     session_df = df[df["shift"] == shift]
-    session_mt = compute_top_mean(session_df)
-    MQ = 30  # Fixed qualifying marks
-    if session_mt == MQ:
+    M_t_session = compute_top_mean(session_df)
+
+    # If M_t_session == M_q_session => fallback
+    if M_t_session == M_q_session:
         normalized = raw_marks
     else:
-        normalized = ((global_mt - MQ) / (session_mt - MQ)) * (raw_marks - MQ) + MQ
-    return normalized, global_mt, session_mt
+        normalized = M_q_global + ((M_t_global - M_q_global) / (M_t_session - M_q_session)) * (raw_marks - M_q_session)
 
-def compute_gate_score(marks, mq, mt, sq=350, st=900):
-    if marks < mq:
-        return 100  # Return a low score for candidates below qualifying marks
-    return sq + (st - sq) * ((marks - mq) / (mt - mq))
+    return normalized, M_t_global, M_t_session, M_q_global
 
+def compute_gate_score(marks, df):
+    """
+    1) Compute M_q (cutoff) from entire data.
+    2) Compute M_t (top mean).
+    3) If marks < M_q => 100.
+    4) Else linear interpolation between S_q=350 and S_t=1000.
+    """
+    M_q = compute_cutoff(df)      # cutoff for entire data
+    M_t = compute_top_mean(df)    # top mean for entire data
+    S_q = 350
+    S_t = 1000
+
+    if marks < M_q:
+        return 100.0
+
+    return S_q + (S_t - S_q) * ((marks - M_q) / (M_t - M_q))
+
+# ------------------------------------------------------------------------------
+# 4) ROUTES
+# ------------------------------------------------------------------------------
 @app.route("/")
 def home():
     return render_template("index.html")
@@ -97,7 +165,7 @@ def home():
 def predict():
     data = request.get_json()
 
-    # Normalize candidate_id: trim spaces and convert to uppercase.
+    # Normalize candidate_id
     candidate_id = data.get("candidate_id", "").strip().upper()
     raw_marks = data.get("rawMarks")
     shift = data.get("shift")
@@ -106,11 +174,12 @@ def predict():
     if not candidate_id or raw_marks is None or shift is None:
         return jsonify({"error": "Candidate ID, rawMarks, and shift are required"}), 400
 
-    # Validate candidate_id format using regex
+    # Validate candidate_id format
     pattern = r'^CS\d{2}S\d{8}$'
     if not re.fullmatch(pattern, candidate_id):
-        return jsonify({"error": "Candidate ID must be in the format CS##S######## (e.g., CS25S13049105)"}), 400
+        return jsonify({"error": "Candidate ID must be in format CS##S######## (e.g., CS25S13049105)"}), 400
 
+    # Validate marks
     try:
         raw_marks = float(raw_marks)
         if raw_marks < 0 or raw_marks > 100:
@@ -118,14 +187,14 @@ def predict():
     except ValueError:
         return jsonify({"error": "rawMarks must be a number"}), 400
 
-    branch = "CSE"  # Fixed for CSE
-
-    # Load existing data (which will be cleaned automatically)
+    # Load existing data & update or append
     df = load_candidate_data()
+    branch = "CSE"
 
-    # Check if candidate_id already exists and update record; otherwise, append new record.
     if candidate_id in df["candidate_id"].astype(str).values:
-        df.loc[df["candidate_id"] == candidate_id, ["marks", "shift", "timestamp"]] = [raw_marks, shift, datetime.utcnow()]
+        df.loc[df["candidate_id"] == candidate_id, ["marks", "shift", "timestamp"]] = [
+            raw_marks, shift, datetime.utcnow()
+        ]
     else:
         new_entry = pd.DataFrame([{
             "candidate_id": candidate_id,
@@ -137,8 +206,12 @@ def predict():
         df = pd.concat([df, new_entry], ignore_index=True)
     save_candidate_data(df)
 
-    normalized_marks, global_mt, session_mt = normalize_marks(raw_marks, shift)
-    gate_score = compute_gate_score(normalized_marks, 30, global_mt)
+    # Multi-session normalization
+    normalized_marks, global_mt, session_mt, M_q_global = normalize_marks(raw_marks, shift)
+
+    # Final GATE score
+    gate_score = compute_gate_score(normalized_marks, df)
+
     user_count = df["candidate_id"].nunique()
 
     return jsonify({
@@ -148,17 +221,16 @@ def predict():
         "gateScore": round(gate_score, 2),
         "globalMt": round(global_mt, 2),
         "sessionMt": round(session_mt, 2),
+        "cutoffGlobal": round(M_q_global, 2),
         "userCount": user_count
     })
 
-# Admin route: Returns all candidate data as JSON.
 @app.route("/admin/data", methods=["GET"])
 def admin_data():
     df = load_candidate_data()
     data = df.to_dict(orient="records")
     return jsonify(data)
 
-# Admin route: Download candidate data as CSV.
 @app.route("/admin/download", methods=["GET"])
 def admin_download():
     df = load_candidate_data()
