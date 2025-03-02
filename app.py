@@ -1,4 +1,5 @@
 import os
+import re
 import pandas as pd
 import io
 import csv
@@ -10,10 +11,45 @@ app = Flask(__name__)
 # Define the Excel file path for storing candidate inputs
 EXCEL_FILE = "candidate_data.xlsx"
 
+def clean_candidate_data(df):
+    """
+    Clean and validate candidate data:
+      - Normalize candidate_id: trim, uppercase, and ensure it matches the pattern CS##S########.
+      - Ensure marks are numeric and between 0 and 100.
+      - Ensure shift is either "Morning" or "Afternoon" (case-insensitive).
+      - Ensure branch is "CSE".
+    Invalid rows are removed.
+    """
+    if df.empty:
+        return df
+
+    # Normalize candidate_id: convert to string, strip spaces, and uppercase
+    df["candidate_id"] = df["candidate_id"].astype(str).str.strip().str.upper()
+    # Keep only rows where candidate_id matches the required format.
+    valid_pattern = r'^CS\d{2}S\d{8}$'
+    df = df[df["candidate_id"].str.fullmatch(valid_pattern, na=False)]
+
+    # Convert marks to numeric and remove rows where marks are not between 0 and 100.
+    df["marks"] = pd.to_numeric(df["marks"], errors="coerce")
+    df = df[df["marks"].between(0, 100)]
+
+    # Normalize shift: capitalize and remove extra spaces.
+    df["shift"] = df["shift"].astype(str).str.strip().str.capitalize()
+    df = df[df["shift"].isin(["Morning", "Afternoon"])]
+
+    # Normalize branch (should be "CSE")
+    df["branch"] = df["branch"].astype(str).str.strip().str.upper()
+    df = df[df["branch"] == "CSE"]
+
+    return df
+
 def load_candidate_data():
     if os.path.exists(EXCEL_FILE):
         try:
             df = pd.read_excel(EXCEL_FILE)
+            df = clean_candidate_data(df)
+            # Optionally, save the cleaned data back to the Excel file.
+            save_candidate_data(df)
             return df
         except Exception as e:
             app.logger.error(f"Error reading Excel file: {e}")
@@ -60,22 +96,34 @@ def home():
 @app.route("/api/predict", methods=["POST"])
 def predict():
     data = request.get_json()
-    candidate_id = data.get("candidate_id")
+
+    # Normalize candidate_id: trim spaces and convert to uppercase.
+    candidate_id = data.get("candidate_id", "").strip().upper()
     raw_marks = data.get("rawMarks")
     shift = data.get("shift")
-    if candidate_id is None or raw_marks is None or shift is None:
+
+    # Validate required fields
+    if not candidate_id or raw_marks is None or shift is None:
         return jsonify({"error": "Candidate ID, rawMarks, and shift are required"}), 400
+
+    # Validate candidate_id format using regex
+    pattern = r'^CS\d{2}S\d{8}$'
+    if not re.fullmatch(pattern, candidate_id):
+        return jsonify({"error": "Candidate ID must be in the format CS##S######## (e.g., CS25S13049105)"}), 400
 
     try:
         raw_marks = float(raw_marks)
+        if raw_marks < 0 or raw_marks > 100:
+            return jsonify({"error": "Marks must be between 0 and 100."}), 400
     except ValueError:
         return jsonify({"error": "rawMarks must be a number"}), 400
 
-    branch = "CSE"  # Fixed as CSE
+    branch = "CSE"  # Fixed for CSE
 
-    # Load existing data from the Excel file
+    # Load existing data (which will be cleaned automatically)
     df = load_candidate_data()
-    # Treat candidate_id as the primary key: update if exists; otherwise, append.
+
+    # Check if candidate_id already exists and update record; otherwise, append new record.
     if candidate_id in df["candidate_id"].astype(str).values:
         df.loc[df["candidate_id"] == candidate_id, ["marks", "shift", "timestamp"]] = [raw_marks, shift, datetime.utcnow()]
     else:
@@ -124,5 +172,4 @@ def admin_download():
                     headers={"Content-Disposition": "attachment;filename=candidate_data.csv"})
 
 if __name__ == "__main__":
-    # In production, run using a WSGI server (e.g., gunicorn via a Procfile)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
